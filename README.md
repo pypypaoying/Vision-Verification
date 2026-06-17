@@ -2,6 +2,8 @@
 
 这个仓库用于在另一台服务器上准备 VisionTS 验证实验环境。它不是完整 VisionTS fork，而是一个轻量补丁包：脚本会 clone 官方 VisionTS，然后应用本仓库里的验证补丁。
 
+完整环境配置、checkpoint、数据下载、运行和报告输出流程见 [FULL_WORKFLOW.md](FULL_WORKFLOW.md)。
+
 ## 快速开始
 
 ```bash
@@ -47,6 +49,16 @@ CUDA_VISIBLE_DEVICES=0 bash scripts/vision_verification/run_ettm1_quick.sh
 CUDA_VISIBLE_DEVICES=0 bash scripts/vision_verification/run_official_ltsf_suite.sh
 ```
 
+完整套件会生成：
+
+```text
+long_term_tsf/save/vision_verification/summary.csv
+long_term_tsf/save/vision_verification/report_mse.csv
+long_term_tsf/save/vision_verification/report_mae.csv
+long_term_tsf/save/vision_verification/report_mse_delta_vs_visionts_none.csv
+long_term_tsf/save/vision_verification/report_mse_ratio_vs_visionts_none.csv
+```
+
 ## 默认验证矩阵
 
 每个数据集和预测长度都会跑：
@@ -59,12 +71,6 @@ CUDA_VISIBLE_DEVICES=0 bash scripts/vision_verification/run_official_ltsf_suite.
 - `VisionTS/row_shuffle`: 打乱渲染图的周期内行结构。
 - `VisionTS/col_shuffle`: 打乱渲染图的周期列顺序。
 - `VisionTS/image_patch_shuffle`: 打乱 MAE patch 级空间布局。
-
-结果会汇总到：
-
-```text
-long_term_tsf/save/vision_verification/summary.csv
-```
 
 ## 常用裁剪
 
