@@ -1,0 +1,182 @@
+From 25d7a3f3a0dfb3c395f5dd5f34b2d8072e10f99b Mon Sep 17 00:00:00 2001
+From: pypypaoying <ab2669805434@gmail.com>
+Date: Wed, 17 Jun 2026 04:36:33 +0000
+Subject: [PATCH] Add verification report tables
+
+---
+ .../scripts/vision_verification/README.md     |  13 +++
+ .../vision_verification/make_report_tables.py | 107 ++++++++++++++++++
+ .../vision_verification/run_ettm1_quick.sh    |   4 +
+ .../run_official_ltsf_suite.sh                |   4 +
+ 4 files changed, 128 insertions(+)
+ create mode 100755 long_term_tsf/scripts/vision_verification/make_report_tables.py
+
+diff --git a/long_term_tsf/scripts/vision_verification/README.md b/long_term_tsf/scripts/vision_verification/README.md
+index 158801c..d10ce5f 100644
+--- a/long_term_tsf/scripts/vision_verification/README.md
++++ b/long_term_tsf/scripts/vision_verification/README.md
+@@ -99,12 +99,25 @@ The suite writes a summary CSV:
+ long_term_tsf/save/vision_verification/summary.csv
+ ```
+ 
++It also writes wide report tables:
++
++```text
++long_term_tsf/save/vision_verification/report_mse.csv
++long_term_tsf/save/vision_verification/report_mae.csv
++long_term_tsf/save/vision_verification/report_mse_delta_vs_visionts_none.csv
++long_term_tsf/save/vision_verification/report_mse_ratio_vs_visionts_none.csv
++```
++
+ You can regenerate it manually:
+ 
+ ```bash
+ python scripts/vision_verification/summarize_verification.py \
+   --root save/vision_verification \
+   --out save/vision_verification/summary.csv
++
++python scripts/vision_verification/make_report_tables.py \
++  --summary save/vision_verification/summary.csv \
++  --out-dir save/vision_verification
+ ```
+ 
+ ## Reading the Evidence
+diff --git a/long_term_tsf/scripts/vision_verification/make_report_tables.py b/long_term_tsf/scripts/vision_verification/make_report_tables.py
+new file mode 100755
+index 0000000..132bca4
+--- /dev/null
++++ b/long_term_tsf/scripts/vision_verification/make_report_tables.py
+@@ -0,0 +1,107 @@
++#!/usr/bin/env python
++import argparse
++import csv
++from collections import defaultdict
++from pathlib import Path
++
++
++def read_summary(path):
++    with path.open(newline="") as f:
++        return list(csv.DictReader(f))
++
++
++def variant_key(row):
++    model = row["model"]
++    variant = row["variant"]
++    if model == "VisionTS":
++        return variant
++    return f"{model}/{variant}"
++
++
++def write_wide(rows, metric, out_path):
++    grouped = defaultdict(dict)
++    columns = []
++    seen_columns = set()
++
++    for row in rows:
++        key = (row["data"], int(row["pred_len"]))
++        column = variant_key(row)
++        if column not in seen_columns:
++            columns.append(column)
++            seen_columns.add(column)
++        grouped[key][column] = row[metric]
++
++    preferred = [
++        "none",
++        "stats_only",
++        "time_reverse",
++        "time_permute",
++        "row_shuffle",
++        "col_shuffle",
++        "image_patch_shuffle",
++    ]
++    ordered_columns = [c for c in preferred if c in seen_columns]
++    ordered_columns += sorted(c for c in columns if c not in preferred)
++
++    with out_path.open("w", newline="") as f:
++        writer = csv.writer(f)
++        writer.writerow(["data", "pred_len"] + ordered_columns)
++        for data, pred_len in sorted(grouped):
++            values = grouped[(data, pred_len)]
++            writer.writerow([data, pred_len] + [values.get(column, "") for column in ordered_columns])
++
++
++def write_relative(rows, metric, mode, out_path):
++    grouped = defaultdict(dict)
++    columns = []
++    seen_columns = set()
++
++    for row in rows:
++        key = (row["data"], int(row["pred_len"]))
++        column = variant_key(row)
++        if column not in seen_columns and column != "none":
++            columns.append(column)
++            seen_columns.add(column)
++        grouped[key][column] = float(row[metric])
++
++    with out_path.open("w", newline="") as f:
++        writer = csv.writer(f)
++        writer.writerow(["data", "pred_len"] + columns)
++        for data, pred_len in sorted(grouped):
++            values = grouped[(data, pred_len)]
++            baseline = values.get("none")
++            row = [data, pred_len]
++            for column in columns:
++                value = values.get(column)
++                if baseline is None or value is None:
++                    row.append("")
++                elif mode == "delta":
++                    row.append(value - baseline)
++                else:
++                    row.append(value / baseline if baseline != 0 else "")
++            writer.writerow(row)
++
++
++def main():
++    parser = argparse.ArgumentParser(description="Create wide report tables from verification summary.csv.")
++    parser.add_argument("--summary", type=Path, required=True)
++    parser.add_argument("--out-dir", type=Path, default=None)
++    args = parser.parse_args()
++
++    rows = read_summary(args.summary)
++    if not rows:
++        raise SystemExit(f"No rows found in {args.summary}")
++
++    out_dir = args.out_dir or args.summary.parent
++    out_dir.mkdir(parents=True, exist_ok=True)
++
++    write_wide(rows, "mse", out_dir / "report_mse.csv")
++    write_wide(rows, "mae", out_dir / "report_mae.csv")
++    write_relative(rows, "mse", "delta", out_dir / "report_mse_delta_vs_visionts_none.csv")
++    write_relative(rows, "mse", "ratio", out_dir / "report_mse_ratio_vs_visionts_none.csv")
++
++    print(f"Wrote report tables to {out_dir}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/long_term_tsf/scripts/vision_verification/run_ettm1_quick.sh b/long_term_tsf/scripts/vision_verification/run_ettm1_quick.sh
+index 62aa106..9187296 100755
+--- a/long_term_tsf/scripts/vision_verification/run_ettm1_quick.sh
++++ b/long_term_tsf/scripts/vision_verification/run_ettm1_quick.sh
+@@ -19,3 +19,7 @@ export RESULT_ROOT="${RESULT_ROOT:-save/vision_verification_quick}"
+ python "${SCRIPT_DIR}/summarize_verification.py" \
+     --root "${RESULT_ROOT}" \
+     --out "${RESULT_ROOT}/summary.csv"
++
++python "${SCRIPT_DIR}/make_report_tables.py" \
++    --summary "${RESULT_ROOT}/summary.csv" \
++    --out-dir "${RESULT_ROOT}"
+diff --git a/long_term_tsf/scripts/vision_verification/run_official_ltsf_suite.sh b/long_term_tsf/scripts/vision_verification/run_official_ltsf_suite.sh
+index 58ec950..4c63ad5 100755
+--- a/long_term_tsf/scripts/vision_verification/run_official_ltsf_suite.sh
++++ b/long_term_tsf/scripts/vision_verification/run_official_ltsf_suite.sh
+@@ -79,3 +79,7 @@ done
+ python "${SCRIPT_DIR}/summarize_verification.py" \
+     --root "${RESULT_ROOT}" \
+     --out "${RESULT_ROOT}/summary.csv"
++
++python "${SCRIPT_DIR}/make_report_tables.py" \
++    --summary "${RESULT_ROOT}/summary.csv" \
++    --out-dir "${RESULT_ROOT}"
+-- 
+2.43.0
