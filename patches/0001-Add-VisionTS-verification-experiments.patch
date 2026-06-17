@@ -1,0 +1,691 @@
+From 31945d26a1e0e5298655689216c883cfdb717d6b Mon Sep 17 00:00:00 2001
+From: pypypaoying <ab2669805434@gmail.com>
+Date: Wed, 17 Jun 2026 04:07:08 +0000
+Subject: [PATCH] Add VisionTS verification experiments
+
+---
+ long_term_tsf/exp/exp_basic.py                |   5 +-
+ long_term_tsf/models/SeasonalNaive.py         |  41 +++++++
+ long_term_tsf/models/VisionTS.py              |   9 +-
+ long_term_tsf/run.py                          |   7 +-
+ .../scripts/vision_verification/README.md     | 115 ++++++++++++++++++
+ .../vision_verification/run_ettm1_quick.sh    |  21 ++++
+ .../run_official_ltsf_suite.sh                |  81 ++++++++++++
+ .../run_verification_dataset.sh               |  94 ++++++++++++++
+ .../summarize_verification.py                 |  86 +++++++++++++
+ visionts/model.py                             |  84 ++++++++++++-
+ 10 files changed, 538 insertions(+), 5 deletions(-)
+ create mode 100644 long_term_tsf/models/SeasonalNaive.py
+ create mode 100644 long_term_tsf/scripts/vision_verification/README.md
+ create mode 100755 long_term_tsf/scripts/vision_verification/run_ettm1_quick.sh
+ create mode 100755 long_term_tsf/scripts/vision_verification/run_official_ltsf_suite.sh
+ create mode 100755 long_term_tsf/scripts/vision_verification/run_verification_dataset.sh
+ create mode 100755 long_term_tsf/scripts/vision_verification/summarize_verification.py
+
+diff --git a/long_term_tsf/exp/exp_basic.py b/long_term_tsf/exp/exp_basic.py
+index e77fa55..eb77861 100644
+--- a/long_term_tsf/exp/exp_basic.py
++++ b/long_term_tsf/exp/exp_basic.py
+@@ -2,7 +2,7 @@ import os
+ import torch
+ from models import Autoformer, Transformer, TimesNet, Nonstationary_Transformer, DLinear, FEDformer, \
+     Informer, LightTS, Reformer, ETSformer, Pyraformer, PatchTST, MICN, Crossformer, FiLM, VisionTS, iTransformer, \
+-    Koopa, TiDE, FreTS
++    Koopa, TiDE, FreTS, SeasonalNaive
+ 
+ 
+ class Exp_Basic(object):
+@@ -28,7 +28,8 @@ class Exp_Basic(object):
+             'Koopa': Koopa,
+             'TiDE': TiDE,
+             'FreTS': FreTS, 
+-            'VisionTS': VisionTS
++            'VisionTS': VisionTS,
++            'SeasonalNaive': SeasonalNaive,
+         }
+         self.device = self._acquire_device()
+         self.model = self._build_model().to(self.device)
+diff --git a/long_term_tsf/models/SeasonalNaive.py b/long_term_tsf/models/SeasonalNaive.py
+new file mode 100644
+index 0000000..e63f282
+--- /dev/null
++++ b/long_term_tsf/models/SeasonalNaive.py
+@@ -0,0 +1,41 @@
++import math
++
++import torch
++from torch import nn
++
++
++class Model(nn.Module):
++    def __init__(self, config):
++        super().__init__()
++        self.task_name = config.task_name
++        self.pred_len = config.pred_len
++        self.seq_len = config.seq_len
++        self.periodicity = max(1, int(config.periodicity))
++        self.dummy = nn.Parameter(torch.zeros(1))
++
++    def forecast(self, x_enc, x_mark_enc=None, x_dec=None, x_mark_dec=None):
++        period = min(self.periodicity, x_enc.shape[1])
++        pattern = x_enc[:, -period:, :]
++        repeat_count = math.ceil(self.pred_len / period)
++        y = pattern.repeat(1, repeat_count, 1)[:, :self.pred_len, :]
++        return y + self.dummy * 0.0
++
++    def imputation(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask):
++        raise NotImplementedError()
++
++    def anomaly_detection(self, x_enc):
++        raise NotImplementedError()
++
++    def classification(self, x_enc, x_mark_enc):
++        raise NotImplementedError()
++
++    def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None):
++        if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
++            return self.forecast(x_enc, x_mark_enc, x_dec, x_mark_dec)
++        if self.task_name == 'imputation':
++            return self.imputation(x_enc, x_mark_enc, x_dec, x_mark_dec, mask)
++        if self.task_name == 'anomaly_detection':
++            return self.anomaly_detection(x_enc)
++        if self.task_name == 'classification':
++            return self.classification(x_enc, x_mark_enc)
++        return None
+diff --git a/long_term_tsf/models/VisionTS.py b/long_term_tsf/models/VisionTS.py
+index 5a0ff42..7de42a8 100644
+--- a/long_term_tsf/models/VisionTS.py
++++ b/long_term_tsf/models/VisionTS.py
+@@ -17,7 +17,14 @@ class Model(nn.Module):
+         self.pred_len = config.pred_len
+         self.seq_len = config.seq_len
+ 
+-        self.vm = VisionTS(arch=config.vm_arch, finetune_type=config.ft_type, load_ckpt=config.vm_pretrained == 1, ckpt_dir=config.vm_ckpt)
++        self.vm = VisionTS(
++            arch=config.vm_arch,
++            finetune_type=config.ft_type,
++            load_ckpt=config.vm_pretrained == 1,
++            ckpt_dir=config.vm_ckpt,
++            ablation=config.ablation,
++            ablation_seed=config.ablation_seed,
++        )
+ 
+         self.vm.update_config(context_len=config.seq_len, pred_len=config.pred_len, periodicity=config.periodicity, interpolation=config.interpolation, norm_const=config.norm_const, align_const=config.align_const)
+ 
+diff --git a/long_term_tsf/run.py b/long_term_tsf/run.py
+index df0979b..e6bb121 100644
+--- a/long_term_tsf/run.py
++++ b/long_term_tsf/run.py
+@@ -25,7 +25,7 @@ if __name__ == '__main__':
+     parser.add_argument('--model_id', type=str, required=True, default='test', help='model id')
+     parser.add_argument('--save_dir', type=str, default='.', help='save dir')
+     parser.add_argument('--model', type=str, required=True, default='Autoformer',
+-                        help='model name, options: [Autoformer, Transformer, TimesNet]')
++                        help='model name, options: [Autoformer, Transformer, TimesNet, VisionTS, SeasonalNaive]')
+ 
+     # data loader
+     parser.add_argument('--data', type=str, required=True, default='ETTm1', help='dataset type')
+@@ -106,6 +106,11 @@ if __name__ == '__main__':
+     parser.add_argument('--interpolation', type=str, default='bilinear')
+     parser.add_argument('--norm_const', type=float, default=0.4)
+     parser.add_argument('--align_const', type=float, default=0.4)
++    parser.add_argument('--ablation', type=str, default='none',
++                        choices=['none', 'stats_only', 'time_reverse', 'time_permute', 'row_shuffle', 'col_shuffle', 'image_patch_shuffle'],
++                        help='VisionTS ablation mode')
++    parser.add_argument('--ablation_seed', type=int, default=0,
++                        help='seed for deterministic VisionTS ablation permutations')
+ 
+ 
+     args = parser.parse_args()
+diff --git a/long_term_tsf/scripts/vision_verification/README.md b/long_term_tsf/scripts/vision_verification/README.md
+new file mode 100644
+index 0000000..158801c
+--- /dev/null
++++ b/long_term_tsf/scripts/vision_verification/README.md
+@@ -0,0 +1,115 @@
++# VisionTS Verification Scripts
++
++This directory runs a zero-shot verification matrix for checking whether VisionTS gains come from the visual MAE pathway or from the numerical time-series structure used to render the image.
++
++## What Is Compared
++
++Each dataset and prediction length runs:
++
++- `SeasonalNaive`: repeats the last observed period with the same `periodicity` used by VisionTS.
++- `VisionTS/none`: the official VisionTS path.
++- `VisionTS/stats_only`: zeros the normalized input after mean/std are computed.
++- `VisionTS/time_reverse`: reverses the normalized lookback sequence.
++- `VisionTS/time_permute`: deterministically permutes the normalized lookback sequence.
++- `VisionTS/row_shuffle`: shuffles rows in the rendered periodic image.
++- `VisionTS/col_shuffle`: shuffles columns in the rendered periodic image.
++- `VisionTS/image_patch_shuffle`: shuffles MAE-size patches in the visible image area.
++
++All runs use `train_epochs=0` and the official long-term forecasting metric pipeline.
++
++## Expected Layout
++
++Run scripts from this repository after placing data and checkpoints in the usual official locations:
++
++```text
++VisionTS/
++  ckpt/
++    mae_visualize_vit_base.pth
++  long_term_tsf/
++    dataset/
++      ETT-small/
++        ETTm1.csv
++        ETTm2.csv
++        ETTh1.csv
++        ETTh2.csv
++      electricity/
++        electricity.csv
++      weather/
++        weather.csv
++```
++
++The checkpoint directory defaults to `../ckpt/` relative to `long_term_tsf`.
++
++## Quick Smoke Test
++
++From the repository root:
++
++```bash
++cd long_term_tsf
++CUDA_VISIBLE_DEVICES=0 bash scripts/vision_verification/run_ettm1_quick.sh
++```
++
++This runs `ETTm1` with `pred_len=96` only.
++
++## Official Zero-Shot Verification Suite
++
++From the repository root:
++
++```bash
++cd long_term_tsf
++CUDA_VISIBLE_DEVICES=0 bash scripts/vision_verification/run_official_ltsf_suite.sh
++```
++
++By default this runs:
++
++```text
++ETTm1 ETTm2 ETTh1 ETTh2 ECL Weather
++```
++
++with prediction lengths:
++
++```text
++96 192 336 720
++```
++
++Useful overrides:
++
++```bash
++DATASETS="ETTm1 Weather" PRED_LENS="96 192" CUDA_VISIBLE_DEVICES=0 \
++  bash scripts/vision_verification/run_official_ltsf_suite.sh
++
++ABLATIONS="none stats_only time_permute col_shuffle" PRED_LENS="96" \
++  bash scripts/vision_verification/run_ettm1_quick.sh
++
++RUN_SEASONAL_NAIVE=0 bash scripts/vision_verification/run_ettm1_quick.sh
++RUN_VISIONTS=0 bash scripts/vision_verification/run_ettm1_quick.sh
++```
++
++## Results
++
++Each run writes into:
++
++```text
++long_term_tsf/save/vision_verification/<DATA>/pl_<PRED_LEN>/<MODEL>/<VARIANT>/
++```
++
++The suite writes a summary CSV:
++
++```text
++long_term_tsf/save/vision_verification/summary.csv
++```
++
++You can regenerate it manually:
++
++```bash
++python scripts/vision_verification/summarize_verification.py \
++  --root save/vision_verification \
++  --out save/vision_verification/summary.csv
++```
++
++## Reading the Evidence
++
++- If `SeasonalNaive` is close to `VisionTS/none`, the periodic numerical prior is carrying much of the performance.
++- If `stats_only` is strong, mean/std normalization and level continuation are a serious baseline.
++- If `time_permute` remains strong, temporal ordering is less important than the value distribution.
++- If `row_shuffle`, `col_shuffle`, or `image_patch_shuffle` collapse, the rendered 2D geometry and MAE spatial prior matter.
+diff --git a/long_term_tsf/scripts/vision_verification/run_ettm1_quick.sh b/long_term_tsf/scripts/vision_verification/run_ettm1_quick.sh
+new file mode 100755
+index 0000000..62aa106
+--- /dev/null
++++ b/long_term_tsf/scripts/vision_verification/run_ettm1_quick.sh
+@@ -0,0 +1,21 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++
++export DATA_NAME="${DATA_NAME:-ETTm1}"
++export DATA="${DATA:-ETTm1}"
++export ROOT_PATH="${ROOT_PATH:-./dataset/ETT-small/}"
++export DATA_PATH="${DATA_PATH:-ETTm1.csv}"
++export FEATURES="${FEATURES:-M}"
++export FREQ="${FREQ:-t}"
++export CONTEXT_LEN="${CONTEXT_LEN:-2304}"
++export PERIODICITY="${PERIODICITY:-96}"
++export PRED_LENS="${PRED_LENS:-96}"
++export RESULT_ROOT="${RESULT_ROOT:-save/vision_verification_quick}"
++
++"${SCRIPT_DIR}/run_verification_dataset.sh"
++
++python "${SCRIPT_DIR}/summarize_verification.py" \
++    --root "${RESULT_ROOT}" \
++    --out "${RESULT_ROOT}/summary.csv"
+diff --git a/long_term_tsf/scripts/vision_verification/run_official_ltsf_suite.sh b/long_term_tsf/scripts/vision_verification/run_official_ltsf_suite.sh
+new file mode 100755
+index 0000000..58ec950
+--- /dev/null
++++ b/long_term_tsf/scripts/vision_verification/run_official_ltsf_suite.sh
+@@ -0,0 +1,81 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++
++DATASETS="${DATASETS:-ETTm1 ETTm2 ETTh1 ETTh2 ECL Weather}"
++RESULT_ROOT="${RESULT_ROOT:-save/vision_verification}"
++export RESULT_ROOT
++
++for dataset_name in ${DATASETS}; do
++    case "${dataset_name}" in
++        ETTm1)
++            export DATA_NAME="ETTm1"
++            export DATA="ETTm1"
++            export ROOT_PATH="./dataset/ETT-small/"
++            export DATA_PATH="ETTm1.csv"
++            export CONTEXT_LEN="2304"
++            export PERIODICITY="96"
++            export FREQ="t"
++            ;;
++        ETTm2)
++            export DATA_NAME="ETTm2"
++            export DATA="ETTm2"
++            export ROOT_PATH="./dataset/ETT-small/"
++            export DATA_PATH="ETTm2.csv"
++            export CONTEXT_LEN="4032"
++            export PERIODICITY="96"
++            export FREQ="t"
++            ;;
++        ETTh1)
++            export DATA_NAME="ETTh1"
++            export DATA="ETTh1"
++            export ROOT_PATH="./dataset/ETT-small/"
++            export DATA_PATH="ETTh1.csv"
++            export CONTEXT_LEN="2880"
++            export PERIODICITY="24"
++            export FREQ="h"
++            ;;
++        ETTh2)
++            export DATA_NAME="ETTh2"
++            export DATA="ETTh2"
++            export ROOT_PATH="./dataset/ETT-small/"
++            export DATA_PATH="ETTh2.csv"
++            export CONTEXT_LEN="1728"
++            export PERIODICITY="24"
++            export FREQ="h"
++            ;;
++        ECL)
++            export DATA_NAME="ECL"
++            export DATA="custom"
++            export ROOT_PATH="./dataset/electricity/"
++            export DATA_PATH="electricity.csv"
++            export CONTEXT_LEN="2880"
++            export PERIODICITY="24"
++            export FREQ="h"
++            ;;
++        Weather)
++            export DATA_NAME="Weather"
++            export DATA="custom"
++            export ROOT_PATH="./dataset/weather/"
++            export DATA_PATH="weather.csv"
++            export CONTEXT_LEN="4032"
++            export PERIODICITY="144"
++            export FREQ="t"
++            ;;
++        *)
++            echo "Unknown dataset '${dataset_name}'. Supported: ETTm1 ETTm2 ETTh1 ETTh2 ECL Weather" >&2
++            exit 2
++            ;;
++    esac
++
++    export FEATURES="${FEATURES:-M}"
++    export ALIGN_CONST="${ALIGN_CONST:-0.4}"
++    export NORM_CONST="${NORM_CONST:-0.4}"
++
++    "${SCRIPT_DIR}/run_verification_dataset.sh"
++done
++
++python "${SCRIPT_DIR}/summarize_verification.py" \
++    --root "${RESULT_ROOT}" \
++    --out "${RESULT_ROOT}/summary.csv"
+diff --git a/long_term_tsf/scripts/vision_verification/run_verification_dataset.sh b/long_term_tsf/scripts/vision_verification/run_verification_dataset.sh
+new file mode 100755
+index 0000000..e16799b
+--- /dev/null
++++ b/long_term_tsf/scripts/vision_verification/run_verification_dataset.sh
+@@ -0,0 +1,94 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++LTSF_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
++cd "${LTSF_DIR}"
++
++: "${DATA_NAME:?DATA_NAME is required, e.g. ETTm1}"
++: "${DATA:?DATA is required, e.g. ETTm1 or custom}"
++: "${ROOT_PATH:?ROOT_PATH is required, relative to long_term_tsf is OK}"
++: "${DATA_PATH:?DATA_PATH is required, e.g. ETTm1.csv}"
++: "${CONTEXT_LEN:?CONTEXT_LEN is required}"
++: "${PERIODICITY:?PERIODICITY is required}"
++
++export PYTHONPATH="${LTSF_DIR}/..:${PYTHONPATH:-}"
++
++FEATURES="${FEATURES:-M}"
++TARGET="${TARGET:-OT}"
++FREQ="${FREQ:-h}"
++LABEL_LEN="${LABEL_LEN:-48}"
++PRED_LENS="${PRED_LENS:-96 192 336 720}"
++BATCH_SIZE="${BATCH_SIZE:-32}"
++NUM_WORKERS="${NUM_WORKERS:-10}"
++CKPT_DIR="${CKPT_DIR:-../ckpt/}"
++VM_ARCH="${VM_ARCH:-mae_base}"
++ALIGN_CONST="${ALIGN_CONST:-0.4}"
++NORM_CONST="${NORM_CONST:-0.4}"
++INTERPOLATION="${INTERPOLATION:-bilinear}"
++ABLATION_SEED="${ABLATION_SEED:-0}"
++ABLATIONS="${ABLATIONS:-none stats_only time_reverse time_permute row_shuffle col_shuffle image_patch_shuffle}"
++RESULT_ROOT="${RESULT_ROOT:-save/vision_verification}"
++RUN_SEASONAL_NAIVE="${RUN_SEASONAL_NAIVE:-1}"
++RUN_VISIONTS="${RUN_VISIONTS:-1}"
++SKIP_DONE="${SKIP_DONE:-1}"
++
++run_case() {
++    local model="$1"
++    local variant="$2"
++    local pred_len="$3"
++    shift 3
++
++    local save_dir="${RESULT_ROOT}/${DATA_NAME}/pl_${pred_len}/${model}/${variant}"
++    local metrics_path="${save_dir}/results/_/metrics.npy"
++
++    if [[ "${SKIP_DONE}" == "1" && -f "${metrics_path}" ]]; then
++        echo "[skip] ${DATA_NAME} pred_len=${pred_len} model=${model} variant=${variant}"
++        return
++    fi
++
++    mkdir -p "${save_dir}"
++    echo "[run] ${DATA_NAME} pred_len=${pred_len} model=${model} variant=${variant}"
++
++    python -u run.py \
++        --task_name long_term_forecast \
++        --is_training 1 \
++        --model "${model}" \
++        --root_path "${ROOT_PATH}" \
++        --data_path "${DATA_PATH}" \
++        --save_dir "${save_dir}" \
++        --model_id "${model}_${variant}_${DATA_NAME}_${pred_len}" \
++        --data "${DATA}" \
++        --features "${FEATURES}" \
++        --target "${TARGET}" \
++        --freq "${FREQ}" \
++        --train_epochs 0 \
++        --batch_size "${BATCH_SIZE}" \
++        --num_workers "${NUM_WORKERS}" \
++        --seq_len "${CONTEXT_LEN}" \
++        --label_len "${LABEL_LEN}" \
++        --periodicity "${PERIODICITY}" \
++        --pred_len "${pred_len}" \
++        --vm_arch "${VM_ARCH}" \
++        --vm_ckpt "${CKPT_DIR}" \
++        --norm_const "${NORM_CONST}" \
++        --align_const "${ALIGN_CONST}" \
++        --interpolation "${INTERPOLATION}" \
++        "$@" 2>&1 | tee "${save_dir}/run.log"
++}
++
++for pred_len in ${PRED_LENS}; do
++    if [[ "${RUN_SEASONAL_NAIVE}" == "1" ]]; then
++        run_case "SeasonalNaive" "period_${PERIODICITY}" "${pred_len}" \
++            --ablation none \
++            --ablation_seed "${ABLATION_SEED}"
++    fi
++
++    if [[ "${RUN_VISIONTS}" == "1" ]]; then
++        for ablation in ${ABLATIONS}; do
++            run_case "VisionTS" "${ablation}" "${pred_len}" \
++                --ablation "${ablation}" \
++                --ablation_seed "${ABLATION_SEED}"
++        done
++    fi
++done
+diff --git a/long_term_tsf/scripts/vision_verification/summarize_verification.py b/long_term_tsf/scripts/vision_verification/summarize_verification.py
+new file mode 100755
+index 0000000..77cb37a
+--- /dev/null
++++ b/long_term_tsf/scripts/vision_verification/summarize_verification.py
+@@ -0,0 +1,86 @@
++#!/usr/bin/env python
++import argparse
++import csv
++from pathlib import Path
++
++import numpy as np
++
++
++METRIC_NAMES = [
++    "mae",
++    "mse",
++    "rmse",
++    "mape",
++    "mspe",
++    "best_valid_loss",
++    "best_valid_epoch",
++]
++
++
++def parse_metric_path(root, path):
++    rel_parts = path.relative_to(root).parts
++    if len(rel_parts) < 7:
++        return None
++    if rel_parts[-3:] != ("results", "_", "metrics.npy"):
++        return None
++
++    data_name = rel_parts[-7]
++    pred_len = rel_parts[-6].replace("pl_", "")
++    model = rel_parts[-5]
++    variant = rel_parts[-4]
++    return data_name, pred_len, model, variant
++
++
++def main():
++    parser = argparse.ArgumentParser(description="Summarize VisionTS verification metrics.")
++    parser.add_argument("--root", type=Path, default=Path("save/vision_verification"))
++    parser.add_argument("--out", type=Path, default=None)
++    args = parser.parse_args()
++
++    root = args.root
++    metric_paths = sorted(root.glob("**/results/_/metrics.npy"))
++    rows = []
++
++    for path in metric_paths:
++        parsed = parse_metric_path(root, path)
++        if parsed is None:
++            continue
++        data_name, pred_len, model, variant = parsed
++        metrics = np.load(path)
++        row = {
++            "data": data_name,
++            "pred_len": int(pred_len),
++            "model": model,
++            "variant": variant,
++            "metrics_path": str(path),
++        }
++        for name, value in zip(METRIC_NAMES, metrics):
++            row[name] = float(value)
++        rows.append(row)
++
++    rows.sort(key=lambda x: (x["data"], x["pred_len"], x["model"], x["variant"]))
++
++    if not rows:
++        raise SystemExit(f"No metrics.npy files found under {root}")
++
++    fieldnames = ["data", "pred_len", "model", "variant"] + METRIC_NAMES + ["metrics_path"]
++    out_path = args.out or root / "summary.csv"
++    out_path.parent.mkdir(parents=True, exist_ok=True)
++
++    with out_path.open("w", newline="") as f:
++        writer = csv.DictWriter(f, fieldnames=fieldnames)
++        writer.writeheader()
++        writer.writerows(rows)
++
++    print(f"Wrote {len(rows)} rows to {out_path}")
++    print("Top rows by MSE:")
++    for row in sorted(rows, key=lambda x: x["mse"])[:20]:
++        print(
++            f"{row['data']:>8} pl={row['pred_len']:<3} "
++            f"{row['model']:<13} {row['variant']:<20} "
++            f"mse={row['mse']:.6g} mae={row['mae']:.6g}"
++        )
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/visionts/model.py b/visionts/model.py
+index bef09c7..9e2b67d 100644
+--- a/visionts/model.py
++++ b/visionts/model.py
+@@ -23,12 +23,24 @@ MAE_DOWNLOAD_URL = "https://dl.fbaipublicfiles.com/mae/visualize/"
+ 
+ class VisionTS(nn.Module):
+ 
+-    def __init__(self, arch='mae_base', finetune_type='ln', ckpt_dir='./ckpt/', load_ckpt=True):
++    def __init__(
++        self,
++        arch='mae_base',
++        finetune_type='ln',
++        ckpt_dir='./ckpt/',
++        load_ckpt=True,
++        ablation='none',
++        ablation_seed=0,
++    ):
+         super(VisionTS, self).__init__()
+ 
+         if arch not in MAE_ARCH:
+             raise ValueError(f"Unknown arch: {arch}. Should be in {list(MAE_ARCH.keys())}")
+ 
++        self.ablation = ablation
++        self.ablation_seed = ablation_seed
++        self._ablation_perm_cache = {}
++
+         self.vision_model = MAE_ARCH[arch][0]()
+ 
+         if load_ckpt:
+@@ -55,8 +67,75 @@ class VisionTS(nn.Module):
+                 elif 'attn' in finetune_type:
+                     param.requires_grad = '.attn.' in n
+ 
++    def _fixed_permutation(self, name, length, device):
++        cache_key = (name, length, str(device))
++        if cache_key not in self._ablation_perm_cache:
++            seed_offsets = {
++                'time': 101,
++                'row': 211,
++                'col': 307,
++                'image_patch': 401,
++            }
++            generator = torch.Generator(device='cpu')
++            generator.manual_seed(int(self.ablation_seed) + seed_offsets[name])
++            perm = torch.randperm(length, generator=generator).to(device)
++            self._ablation_perm_cache[cache_key] = perm
++        return self._ablation_perm_cache[cache_key]
++
++    def _apply_sequence_ablation(self, x_enc):
++        if self.ablation == 'stats_only':
++            return torch.zeros_like(x_enc)
++        if self.ablation == 'time_reverse':
++            return torch.flip(x_enc, dims=(-1,))
++        if self.ablation == 'time_permute':
++            perm = self._fixed_permutation('time', x_enc.shape[-1], x_enc.device)
++            return x_enc.index_select(-1, perm)
++        return x_enc
++
++    def _apply_segment_ablation(self, x_2d):
++        if self.ablation == 'row_shuffle':
++            perm = self._fixed_permutation('row', x_2d.shape[-2], x_2d.device)
++            return x_2d.index_select(-2, perm)
++        if self.ablation == 'col_shuffle':
++            perm = self._fixed_permutation('col', x_2d.shape[-1], x_2d.device)
++            return x_2d.index_select(-1, perm)
++        return x_2d
++
++    def _apply_image_ablation(self, x_resize):
++        if self.ablation != 'image_patch_shuffle':
++            return x_resize
++
++        patch_size = self.patch_size
++        bsz, channels, height, width = x_resize.shape
++        if height % patch_size != 0 or width % patch_size != 0:
++            return x_resize
++
++        h_patch = height // patch_size
++        w_patch = width // patch_size
++        x_patch = x_resize.reshape(bsz, channels, h_patch, patch_size, w_patch, patch_size)
++        x_patch = x_patch.permute(0, 2, 4, 1, 3, 5).reshape(
++            bsz, h_patch * w_patch, channels, patch_size, patch_size
++        )
++        perm = self._fixed_permutation('image_patch', h_patch * w_patch, x_resize.device)
++        x_patch = x_patch.index_select(1, perm)
++        x_patch = x_patch.reshape(bsz, h_patch, w_patch, channels, patch_size, patch_size)
++        x_patch = x_patch.permute(0, 3, 1, 4, 2, 5)
++        return x_patch.reshape(bsz, channels, height, width)
++
+     
+     def update_config(self, context_len, pred_len, periodicity=1, norm_const=0.4, align_const=0.4, interpolation='bilinear'):
++        valid_ablations = {
++            'none',
++            'stats_only',
++            'time_reverse',
++            'time_permute',
++            'row_shuffle',
++            'col_shuffle',
++            'image_patch_shuffle',
++        }
++        if self.ablation not in valid_ablations:
++            raise ValueError(f"Unknown ablation: {self.ablation}. Should be in {sorted(valid_ablations)}")
++
+         self.image_size = self.vision_model.patch_embed.img_size[0]
+         self.patch_size = self.vision_model.patch_embed.patch_size[0]
+         self.num_patch = self.image_size // self.patch_size
+@@ -112,13 +191,16 @@ class VisionTS(nn.Module):
+         x_enc /= stdev
+         # Channel Independent
+         x_enc = einops.rearrange(x_enc, 'b s n -> b n s') # [bs x nvars x seq_len]
++        x_enc = self._apply_sequence_ablation(x_enc)
+ 
+         # 2. Segmentation
+         x_pad = F.pad(x_enc, (self.pad_left, 0), mode='replicate') # [b n s]
+         x_2d = einops.rearrange(x_pad, 'b n (p f) -> (b n) 1 f p', f=self.periodicity)
++        x_2d = self._apply_segment_ablation(x_2d)
+ 
+         # 3. Render & Alignment
+         x_resize = self.input_resize(x_2d)
++        x_resize = self._apply_image_ablation(x_resize)
+         masked = torch.zeros((x_2d.shape[0], 1, self.image_size, self.num_patch_output * self.patch_size), device=x_2d.device, dtype=x_2d.dtype)
+         x_concat_with_masked = torch.cat([
+             x_resize, 
+-- 
+2.43.0
